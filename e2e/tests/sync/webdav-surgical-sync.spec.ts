@@ -80,6 +80,317 @@ test.describe('@webdav @surgical WebDAV Surgical sync', () => {
   // Each case drives multiple app contexts through faulted WebDAV requests.
   test.describe.configure({ mode: 'serial' });
 
+  const runMigrationResponseLossRecovery = async ({
+    browser,
+    baseURL,
+    request,
+    faultFile,
+    faultDescription,
+    matchesFault,
+    assertCommittedRemoteState,
+  }: {
+    browser: import('@playwright/test').Browser;
+    baseURL: string | undefined;
+    request: APIRequestContext;
+    faultFile: string;
+    faultDescription: string;
+    matchesFault: (body: string) => boolean;
+    assertCommittedRemoteState: (
+      folderUrl: string,
+      authorization: string,
+    ) => Promise<void>;
+  }): Promise<void> => {
+    const appUrl = baseURL || 'http://localhost:4242';
+    const folderName = generateSyncFolderName(`e2e-surgical-${faultFile}`);
+    const folderUrl = `${WEBDAV_CONFIG_TEMPLATE.baseUrl}${folderName}/DEV/`;
+    const legacyConfig = {
+      ...WEBDAV_CONFIG_TEMPLATE,
+      syncFolderPath: `/${folderName}`,
+      isUseSplitSyncFiles: false,
+    };
+    const splitConfig = { ...legacyConfig, isUseSplitSyncFiles: true };
+    const authorization =
+      'Basic ' +
+      Buffer.from(
+        `${WEBDAV_CONFIG_TEMPLATE.username}:${WEBDAV_CONFIG_TEMPLATE.password}`,
+      ).toString('base64');
+
+    await createSyncFolder(request, folderName);
+
+    let migratingClient: Awaited<ReturnType<typeof setupSyncClient>> | null = null;
+    let legacyClient: Awaited<ReturnType<typeof setupSyncClient>> | null = null;
+    let legacyRequestListener: ((webDavRequest: Request) => void) | null = null;
+
+    try {
+      migratingClient = await setupSyncClient(browser, appUrl);
+      const sync = new SyncPage(migratingClient.page);
+      const workView = new WorkViewPage(migratingClient.page);
+      await sync.setupWebdavSync(legacyConfig);
+
+      const firstLegacyTask = `Legacy-first-${folderName}`;
+      await workView.addTask(firstLegacyTask);
+      await waitForStatePersistence(migratingClient.page);
+      await sync.triggerSync();
+      await waitForSyncComplete(migratingClient.page, sync);
+
+      // Rotate the primary so migration also has a real v2 backup to neutralize.
+      const secondLegacyTask = `Legacy-second-${folderName}`;
+      await workView.addTask(secondLegacyTask);
+      await waitForStatePersistence(migratingClient.page);
+      await sync.triggerSync();
+      await waitForSyncComplete(migratingClient.page, sync);
+
+      const pendingTask = `Pending-during-migration-${folderName}`;
+      await workView.addTask(pendingTask);
+      await waitForStatePersistence(migratingClient.page);
+
+      let faultActive = true;
+      let committedWrite = false;
+      let responseDropped = false;
+      await migratingClient.page.route(`**/${faultFile}`, async (route) => {
+        const body = route.request().postData() ?? '';
+        if (route.request().method() === 'PUT' && faultActive && matchesFault(body)) {
+          if (!committedWrite) {
+            const response = await route.fetch();
+            expect(response.ok()).toBe(true);
+            committedWrite = true;
+          }
+          responseDropped = true;
+          // Keep all retries from observing success; recovery must begin after reload.
+          await route.abort('failed');
+          return;
+        }
+        await route.continue();
+      });
+
+      await sync.setupWebdavSync(splitConfig, { isReconfigure: true });
+      await expect.poll(() => responseDropped).toBe(true);
+      await sync.syncSpinner.waitFor({ state: 'hidden', timeout: 20000 });
+      expect(committedWrite, `${faultDescription} PUT must reach WebDAV`).toBe(true);
+
+      await assertCommittedRemoteState(folderUrl, authorization);
+
+      faultActive = false;
+      await migratingClient.page.reload({ waitUntil: 'domcontentloaded' });
+      await waitForAppReady(migratingClient.page);
+      await sync.triggerSync();
+      await waitForSyncComplete(migratingClient.page, sync);
+
+      await expect(
+        migratingClient.page.locator('task', { hasText: firstLegacyTask }),
+      ).toBeVisible();
+      await expect(
+        migratingClient.page.locator('task', { hasText: secondLegacyTask }),
+      ).toBeVisible();
+      await expect(
+        migratingClient.page.locator('task', { hasText: pendingTask }),
+      ).toHaveCount(1);
+
+      const recoveredPrimary = await readPrefixedFile<SplitTombstone>(
+        request,
+        `${folderUrl}sync-data.json`,
+        authorization,
+      );
+      const recoveredBackup = await readPrefixedFile<SplitTombstone>(
+        request,
+        `${folderUrl}sync-data.json.bak`,
+        authorization,
+      );
+      const recoveredOps = await readSurgicalOpsFile(
+        request,
+        `${folderUrl}sync-ops.json`,
+        authorization,
+      );
+      expect(recoveredPrimary).toMatchObject({ version: 3, format: 'split' });
+      expect(recoveredBackup).toMatchObject({ version: 3, format: 'split' });
+      expect(recoveredOps.migration).toBeUndefined();
+
+      // Split-disabled clients must never overwrite a migration tombstone.
+      legacyClient = await setupSyncClient(browser, appUrl);
+      const legacySync = new SyncPage(legacyClient.page);
+      let legacyPutCount = 0;
+      legacyRequestListener = (webDavRequest: Request): void => {
+        if (
+          webDavRequest.method() === 'PUT' &&
+          webDavRequest.url().startsWith(folderUrl)
+        ) {
+          legacyPutCount++;
+        }
+      };
+      legacyClient.page.on('request', legacyRequestListener);
+      await legacySync.setupWebdavSync(legacyConfig);
+      await expect(legacySync.syncBtn).toHaveAccessibleName(
+        'Sync problem — click to retry',
+        { timeout: 20000 },
+      );
+      const tombstoneDownload = legacyClient.page.waitForResponse(
+        (response) =>
+          response.request().method() === 'GET' &&
+          response.url() === `${folderUrl}sync-data.json` &&
+          response.ok(),
+        { timeout: 20000 },
+      );
+      await legacySync.syncBtn.click({ noWaitAfter: true });
+      await tombstoneDownload;
+      await expect(legacyClient.page.locator('snack-custom .message')).toContainText(
+        /split-file format.*(?:Enable|Turn on).*Surgical sync.*Sync settings/i,
+        { timeout: 20000 },
+      );
+      expect(legacyPutCount).toBe(0);
+    } finally {
+      if (migratingClient) {
+        await migratingClient.page.unroute(`**/${faultFile}`).catch(() => {});
+      }
+      if (legacyClient && legacyRequestListener) {
+        legacyClient.page.off('request', legacyRequestListener);
+      }
+      await closeContextsSafely(migratingClient?.context, legacyClient?.context);
+    }
+  };
+
+  test('recovers when the pending migration-marker response is lost', async ({
+    browser,
+    baseURL,
+    request,
+  }) => {
+    test.slow();
+    await runMigrationResponseLossRecovery({
+      browser,
+      baseURL,
+      request,
+      faultFile: 'sync-ops.json',
+      faultDescription: 'pending migration marker',
+      matchesFault: (body) => body.includes('"status":"pending"'),
+      assertCommittedRemoteState: async (folderUrl, authorization) => {
+        const pendingOps = await readSurgicalOpsFile(
+          request,
+          `${folderUrl}sync-ops.json`,
+          authorization,
+        );
+        expect(pendingOps.migration).toMatchObject({ status: 'pending' });
+        const stateResponse = await request.get(`${folderUrl}sync-state.json`, {
+          headers: { Authorization: authorization },
+        });
+        expect(stateResponse.status()).toBe(404);
+        const primary = await readPrefixedFile<{ version: number }>(
+          request,
+          `${folderUrl}sync-data.json`,
+          authorization,
+        );
+        expect(primary.version).toBe(2);
+      },
+    });
+  });
+
+  test('recovers when the split state response is lost', async ({
+    browser,
+    baseURL,
+    request,
+  }) => {
+    test.slow();
+    await runMigrationResponseLossRecovery({
+      browser,
+      baseURL,
+      request,
+      faultFile: 'sync-state.json',
+      faultDescription: 'split state',
+      matchesFault: () => true,
+      assertCommittedRemoteState: async (folderUrl, authorization) => {
+        const pendingOps = await readSurgicalOpsFile(
+          request,
+          `${folderUrl}sync-ops.json`,
+          authorization,
+        );
+        expect(pendingOps.migration).toMatchObject({ status: 'pending' });
+        const state = await readPrefixedFile<{ version: number }>(
+          request,
+          `${folderUrl}sync-state.json`,
+          authorization,
+        );
+        expect(state.version).toBe(3);
+        const primary = await readPrefixedFile<{ version: number }>(
+          request,
+          `${folderUrl}sync-data.json`,
+          authorization,
+        );
+        expect(primary.version).toBe(2);
+      },
+    });
+  });
+
+  test('recovers when the backup-neutralization response is lost', async ({
+    browser,
+    baseURL,
+    request,
+  }) => {
+    test.slow();
+    await runMigrationResponseLossRecovery({
+      browser,
+      baseURL,
+      request,
+      faultFile: 'sync-data.json.bak',
+      faultDescription: 'backup neutralization',
+      matchesFault: (body) => body.includes('"format":"split"'),
+      assertCommittedRemoteState: async (folderUrl, authorization) => {
+        const pendingOps = await readSurgicalOpsFile(
+          request,
+          `${folderUrl}sync-ops.json`,
+          authorization,
+        );
+        expect(pendingOps.migration).toMatchObject({ status: 'pending' });
+        const backup = await readPrefixedFile<SplitTombstone>(
+          request,
+          `${folderUrl}sync-data.json.bak`,
+          authorization,
+        );
+        expect(backup).toMatchObject({ version: 3, format: 'split' });
+        const primary = await readPrefixedFile<{ version: number }>(
+          request,
+          `${folderUrl}sync-data.json`,
+          authorization,
+        );
+        expect(primary.version).toBe(2);
+      },
+    });
+  });
+
+  test('recovers when the final migration-marker response is lost', async ({
+    browser,
+    baseURL,
+    request,
+  }) => {
+    test.slow();
+    await runMigrationResponseLossRecovery({
+      browser,
+      baseURL,
+      request,
+      faultFile: 'sync-ops.json',
+      faultDescription: 'final migration marker',
+      matchesFault: (body) =>
+        body.includes('"version":3') && !body.includes('"migration"'),
+      assertCommittedRemoteState: async (folderUrl, authorization) => {
+        const finalizedOps = await readSurgicalOpsFile(
+          request,
+          `${folderUrl}sync-ops.json`,
+          authorization,
+        );
+        expect(finalizedOps.migration).toBeUndefined();
+        const primary = await readPrefixedFile<SplitTombstone>(
+          request,
+          `${folderUrl}sync-data.json`,
+          authorization,
+        );
+        const backup = await readPrefixedFile<SplitTombstone>(
+          request,
+          `${folderUrl}sync-data.json.bak`,
+          authorization,
+        );
+        expect(primary).toMatchObject({ version: 3, format: 'split' });
+        expect(backup).toMatchObject({ version: 3, format: 'split' });
+      },
+    });
+  });
+
   test('recovers a v2 migration after the tombstone response is lost', async ({
     browser,
     baseURL,
